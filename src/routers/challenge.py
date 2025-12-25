@@ -1,305 +1,278 @@
+# src/routers/challenge.py
 from __future__ import annotations
 
 from datetime import datetime, date
-from typing import List, Optional
-from zoneinfo import ZoneInfo
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select, delete, func
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
-from src.db.database import get_db
-from src.models.challenge import (
-    Challenges,
-    DailyChallengePick,
-    DailyChallengeUserState,
-)
-from src.models.users import User
 from src.auth.dependencies import get_current_user
+from src.db.database import get_db
+from src.models.users import User
+from src.models.challenge import Challenges, DailyChallengePick, DailyChallengeUserState
 
 router = APIRouter(prefix="/challenges", tags=["챌린지"])
 
-# 프리미엄 유저가 하루에 새로고침 가능한 최대 횟수
-REFRESH_LIMIT = 3
-
-
-# ----------------------------------------
-# 유틸 함수들
-# ----------------------------------------
+# 프리미엄 새로고침 제한(너희 정책에 맞게 조정)
+PREMIUM_REFRESH_LIMIT = 3
 
 
 def today_kst() -> date:
-    """KST 기준 오늘 날짜 반환"""
-    return datetime.now(ZoneInfo("Asia/Seoul")).date()
+    # 서버 타임존이 KST라고 가정 (main.py 스케줄러도 Asia/Seoul 사용)
+    return datetime.now().date()
 
 
-def get_user_state_today(
-    db: Session,
-    user: User,
-    today: Optional[date] = None,
-) -> Optional[DailyChallengeUserState]:
-    """유저의 오늘자 daily 상태 조회 (없으면 None)"""
-    if today is None:
-        today = today_kst()
-
-    return db.scalar(
-        select(DailyChallengeUserState).where(
-            DailyChallengeUserState.owner_cognito_id == user.cognito_id,
-            DailyChallengeUserState.date_for == today,
+# --------------------- 내부 유틸 ---------------------
+def ensure_state(db: Session, uid: str, day: date) -> DailyChallengeUserState:
+    row = (
+        db.query(DailyChallengeUserState)
+        .filter(
+            DailyChallengeUserState.owner_cognito_id == uid,
+            DailyChallengeUserState.date_for == day,
         )
+        .first()
     )
+    if row is None:
+        row = DailyChallengeUserState(owner_cognito_id=uid, date_for=day, refresh_used=0)
+        db.add(row)
+        db.flush()
+    return row
 
 
-def get_user_today_challenges(
-    db: Session,
-    user: User,
-    today: Optional[date] = None,
-) -> List[Challenges]:
-    """
-    유저별 오늘자 챌린지 4개 조회
-    - DailyChallengePick 기반
-    """
-    if today is None:
-        today = today_kst()
+def pick_4_random(db: Session) -> List[Challenges]:
+    rows = db.query(Challenges).order_by(func.rand()).limit(4).all()
+    if len(rows) < 4:
+        raise HTTPException(500, "challenges 테이블에 최소 4개 이상 있어야 합니다.")
+    return rows
 
-    return db.scalars(
-        select(Challenges)
-        .join(DailyChallengePick, DailyChallengePick.challenge_id == Challenges.id)
-        .where(
-            DailyChallengePick.owner_cognito_id == user.cognito_id,
-            DailyChallengePick.date_for == today,
+
+def get_or_create_today_picks(db: Session, uid: str, day: date) -> List[DailyChallengePick]:
+    picks = (
+        db.query(DailyChallengePick)
+        .options(joinedload(DailyChallengePick.challenge))
+        .filter(
+            DailyChallengePick.owner_cognito_id == uid,
+            DailyChallengePick.date_for == day,
         )
-        # slot_index 제거 → 정렬 기준 없애거나, challenge_id 기준으로 정렬
-        #.order_by(DailyChallengePick.challenge_id)
-    ).all()
-
-
-def pick_and_store_user_today(
-    db: Session,
-    user: User,
-    today: Optional[date] = None,
-    *,
-    replace: bool = False,
-) -> List[Challenges]:
-    """
-    유저별 오늘자 챌린지 4개 랜덤 추출 + 저장
-
-    - replace=False:
-        - 이미 오늘자 데이터가 있으면, DB에 있는 것 그대로 사용
-    - replace=True:
-        - 오늘자 데이터를 전부 삭제하고 새로 4개 뽑아서 저장
-    """
-    if today is None:
-        today = today_kst()
-
-    # 이미 있는 거 재활용
-    if not replace:
-        existing = get_user_today_challenges(db, user, today)
-        if existing:
-            return existing
-
-    # 오늘자 기존 데이터 삭제
-    db.execute(
-        delete(DailyChallengePick).where(
-            DailyChallengePick.owner_cognito_id == user.cognito_id,
-            DailyChallengePick.date_for == today,
-        )
+        .all()
     )
+    if picks:
+        # slot_index가 없으니, UI 안정성을 위해 정렬(원하면 빼도 됨)
+        picks.sort(key=lambda p: p.challenge_id)
+        return picks
 
-    # 챌린지 4개 랜덤 추출
-    picked: List[Challenges] = db.scalars(
-        select(Challenges).order_by(func.rand()).limit(4)
-    ).all()
-
-    if not picked:
-        return []
-
-    # 🔥 slot_index 없이 그냥 challenge_id만 저장
-    for c in picked:
-        db.add(
+    challenges = pick_4_random(db)
+    db.add_all(
+        [
             DailyChallengePick(
-                owner_cognito_id=user.cognito_id,
-                date_for=today,
+                owner_cognito_id=uid,
+                date_for=day,
                 challenge_id=c.id,
+                is_complete=False,
             )
-        )
-
+            for c in challenges
+        ]
+    )
     db.commit()
-    return picked
+
+    picks = (
+        db.query(DailyChallengePick)
+        .options(joinedload(DailyChallengePick.challenge))
+        .filter(
+            DailyChallengePick.owner_cognito_id == uid,
+            DailyChallengePick.date_for == day,
+        )
+        .all()
+    )
+    picks.sort(key=lambda p: p.challenge_id)
+    return picks
 
 
-# Pydantic 변환 헬퍼
-def to_dto_list(challenges: List[Challenges]) -> List["ChallengeDTO"]:
-    return [ChallengeDTO.model_validate(c) for c in challenges]
-
-
-# ----------------------------------------
-# DTO
-# ----------------------------------------
-
-
-class ChallengeDTO(BaseModel):
+# --------------------- 스키마 ---------------------
+class DailyChallengeItem(BaseModel):
     id: int
     title: str
     subtitle: str
     give_point: int
-
-    class Config:
-        from_attributes = True
+    is_complete: bool
 
 
 class DailyChallengeResponse(BaseModel):
-    challenges: List[ChallengeDTO]
-    refresh_remaining: int  # 3 → 2 → 1 → 0
-
-    class Config:
-        from_attributes = True
+    date_for: date
+    refresh_remaining: int
+    challenges: List[DailyChallengeItem]
 
 
-class RefreshRemainingResponse(BaseModel):
-    remaining: int  # 남은 새로고침 횟수
-    max: int        # 하루 최대 새로고침 횟수
-
-    class Config:
-        from_attributes = True
+class RefreshDailyResponse(DailyChallengeResponse):
+    pass
 
 
-# ----------------------------------------
-# API 엔드포인트
-# ----------------------------------------
+class CompleteDailyReq(BaseModel):
+    challenge_id: int
 
 
+class CompleteDailyRes(BaseModel):
+    challenge_id: int
+    is_complete: bool
+    earned_point: int
+    total_point: int
+
+
+# --------------------- API ---------------------
 @router.get("/daily", response_model=DailyChallengeResponse)
-def read_today_daily_challenges(
+def get_daily(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    
+    uid = current_user.cognito_id
+    day = today_kst()
 
-    - 모든 유저가 "개인용" 4개를 가진다.
-    - 처음 호출 시: 랜덤으로 4개 뽑아서 저장
-    - 이후 호출 시: 이미 저장된 4개를 그대로 반환
-    - 프리미엄 여부에 따라 refresh_remaining 값만 달라짐
-    """
-    today = today_kst()
+    picks = get_or_create_today_picks(db, uid, day)
 
-    # 1) 유저 개인 daily 챌린지 가져오기 (없으면 새로 생성)
-    picked = pick_and_store_user_today(db, current_user, today, replace=False)
-    if not picked:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="등록된 챌린지가 없습니다.",
-        )
-
-    # 2) 새로고침 남은 횟수 계산
-    if not getattr(current_user, "is_premium", False):
-        # 일반 유저는 새로고침 기능 없음
-        remaining = 0
-    else:
-        state = get_user_state_today(db, current_user, today)
-        if not state:
-            remaining = REFRESH_LIMIT
-        else:
-            remaining = max(0, REFRESH_LIMIT - state.refresh_used)
+    refresh_remaining = 0
+    if current_user.is_premium:
+        state = ensure_state(db, uid, day)
+        refresh_remaining = max(0, PREMIUM_REFRESH_LIMIT - int(state.refresh_used))
+        db.commit()  # state가 새로 생겼을 수도 있으니
 
     return DailyChallengeResponse(
-        challenges=to_dto_list(picked),
-        refresh_remaining=remaining,
+        date_for=day,
+        refresh_remaining=refresh_remaining,
+        challenges=[
+            DailyChallengeItem(
+                id=p.challenge.id,
+                title=p.challenge.title,
+                subtitle=p.challenge.subtitle,
+                give_point=int(p.challenge.give_point),
+                is_complete=bool(p.is_complete),  # ✅ 프론트 체크 표시용
+            )
+            for p in picks
+        ],
     )
 
 
-@router.get("/daily/refresh-remaining", response_model=RefreshRemainingResponse)
-def get_refresh_remaining(
+@router.post("/daily/refresh", response_model=RefreshDailyResponse)
+def refresh_daily(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
- 
-
-    - 프리미엄 유저만 의미 있음
-    - 일반 유저는 remaining=0, max=0 또는 remaining=0, max=REFRESH_LIMIT 중 택1
+    refresh 하면 완료된 챌린지도 그냥 날아가고 새로운 걸로 바뀌게
+    -> 오늘 picks 통째로 삭제 후 새로 4개 생성
     """
-    if not getattr(current_user, "is_premium", False):
-        # 정책에 따라 max=0 으로 줄 수도 있고, max=REFRESH_LIMIT 로 줘도 됨
-        return RefreshRemainingResponse(
-            remaining=0,
-            max=REFRESH_LIMIT,
-        )
+    if not current_user.is_premium:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="프리미엄 전용 기능입니다.")
 
-    today = today_kst()
-    state = get_user_state_today(db, current_user, today)
+    uid = current_user.cognito_id
+    day = today_kst()
 
-    if not state:
-        remaining = REFRESH_LIMIT
-    else:
-        remaining = max(0, REFRESH_LIMIT - state.refresh_used)
+    state = ensure_state(db, uid, day)
+    if int(state.refresh_used) >= PREMIUM_REFRESH_LIMIT:
+        raise HTTPException(status_code=400, detail="오늘 새로고침 횟수를 모두 사용했습니다.")
 
-    return RefreshRemainingResponse(
-        remaining=remaining,
-        max=REFRESH_LIMIT,
+    # 완료 여부 상관없이 오늘 picks 전부 삭제
+    db.query(DailyChallengePick).filter(
+        DailyChallengePick.owner_cognito_id == uid,
+        DailyChallengePick.date_for == day,
+    ).delete(synchronize_session=False)
+
+    challenges = pick_4_random(db)
+    db.add_all(
+        [
+            DailyChallengePick(
+                owner_cognito_id=uid,
+                date_for=day,
+                challenge_id=c.id,
+                is_complete=False,
+            )
+            for c in challenges
+        ]
     )
 
-
-@router.post("/daily/refresh", response_model=DailyChallengeResponse)
-def refresh_daily_challenges(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    
-
-    - 하루 최대 REFRESH_LIMIT 번
-    - 호출 시 마다:
-        1) 유저의 오늘자 새로고침 사용 횟수 확인
-        2) 제한 넘으면 에러
-        3) 넘지 않으면 유저 개인 daily를 새로 4개 뽑아서 저장
-        4) refresh_used += 1
-    """
-    if not getattr(current_user, "is_premium", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="프리미엄 전용 기능입니다.",
-        )
-
-    today = today_kst()
-
-    # 오늘자 state 조회 또는 생성
-    state = get_user_state_today(db, current_user, today)
-    if not state:
-        state = DailyChallengeUserState(
-            owner_cognito_id=current_user.cognito_id,
-            date_for=today,
-            refresh_used=0,
-        )
-        db.add(state)
-        db.commit()
-        db.refresh(state)
-
-    if state.refresh_used >= REFRESH_LIMIT:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="오늘은 더 이상 새로고침할 수 없습니다.",
-        )
-
-    # 유저 개인 daily를 새로 뽑기 (replace=True)
-    picked = pick_and_store_user_today(db, current_user, today, replace=True)
-    if not picked:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="등록된 챌린지가 없습니다.",
-        )
-
-    # 새로고침 사용 횟수 증가
-    state.refresh_used += 1
-    db.add(state)
+    state.refresh_used = int(state.refresh_used) + 1
     db.commit()
-    db.refresh(state)
 
-    remaining = max(0, REFRESH_LIMIT - state.refresh_used)
+    picks = (
+        db.query(DailyChallengePick)
+        .options(joinedload(DailyChallengePick.challenge))
+        .filter(
+            DailyChallengePick.owner_cognito_id == uid,
+            DailyChallengePick.date_for == day,
+        )
+        .all()
+    )
+    picks.sort(key=lambda p: p.challenge_id)
 
-    return DailyChallengeResponse(
-        challenges=to_dto_list(picked),
-        refresh_remaining=remaining,
+    refresh_remaining = max(0, PREMIUM_REFRESH_LIMIT - int(state.refresh_used))
+
+    return RefreshDailyResponse(
+        date_for=day,
+        refresh_remaining=refresh_remaining,
+        challenges=[
+            DailyChallengeItem(
+                id=p.challenge.id,
+                title=p.challenge.title,
+                subtitle=p.challenge.subtitle,
+                give_point=int(p.challenge.give_point),
+                is_complete=bool(p.is_complete),
+            )
+            for p in picks
+        ],
+    )
+
+
+@router.post("/daily/complete", response_model=CompleteDailyRes)
+def complete_daily(
+    body: CompleteDailyReq,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    오늘의 picks 중 challenge_id 완료 처리 + 포인트 지급
+    - 이미 완료면 idempotent(earned_point=0)
+    """
+    uid = current_user.cognito_id
+    day = today_kst()
+
+    # 동시 요청 시 포인트 중복 지급 방지용 row lock
+    row = (
+        db.query(DailyChallengePick)
+        .options(joinedload(DailyChallengePick.challenge))
+        .filter(
+            DailyChallengePick.owner_cognito_id == uid,
+            DailyChallengePick.date_for == day,
+            DailyChallengePick.challenge_id == body.challenge_id,
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="오늘의 챌린지에 없는 항목입니다.")
+
+    if row.is_complete:
+        db.refresh(current_user)
+        return CompleteDailyRes(
+            challenge_id=body.challenge_id,
+            is_complete=True,
+            earned_point=0,
+            total_point=int(current_user.point),
+        )
+
+    row.is_complete = True
+
+    earned = int(row.challenge.give_point)
+    current_user.point = int(current_user.point) + earned
+
+    db.commit()
+    db.refresh(current_user)
+
+    return CompleteDailyRes(
+        challenge_id=body.challenge_id,
+        is_complete=True,
+        earned_point=earned,
+        total_point=int(current_user.point),
     )

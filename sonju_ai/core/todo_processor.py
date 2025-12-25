@@ -6,364 +6,539 @@
 import logging
 import json
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sonju_ai.utils.openai_client import OpenAIClient
 
 logger = logging.getLogger(__name__)
 
+KST = ZoneInfo("Asia/Seoul")
+
 
 class TodoProcessor:
     """
-    할일 추출 전용 서비스 (대화형 상태 머신)
+    채팅 도중에 자연스럽게 "응", "아니" 등으로
+    할일 등록을 이어갈 수 있도록 상태를 들고 있는 클래스.
 
-    - 한 턴에서 새 할일 후보를 발견하면: "지금 말씀하신 '~'를 할일로 등록해 둘까요?" 제안(suggest)
-    - 이후 사용자의 "응/추가해줘/아니야/내일 오후 3시" 등의 응답에 따라:
-      - 최종 확정되면 has_todo=True, step="saved"
-      - 취소되면 step="cancelled"
-      - 무시하고 다른 얘기하면 → 이 pending은 버리고 step="none" 으로 종료
-
-    🔒 불변식(invariant):
-      - 할일 플로우( step in {"suggest","ask_date","saved","cancelled"} )에 들어가는 순간,
-        task는 반드시 존재한다 (None 불가).
-      - has_todo=True 인 결과에서는 항상 task가 존재하고 date는 필수, time은 옵션.
+    - pending_todos[(user_id, chat_list_num)] 에 현재 진행 중인 플로우를 저장한다.
+    - step 값은 다음 중 하나다.
+      - "none"        : 이번 턴에는 할일 관련 없음
+      - "suggest"     : 새 할일 후보 감지 → 등록 여부만 물어본 상태
+      - "ask_confirm" : (내부 state) 유저에게 yes/no를 물은 상태
+      - "ask_date"    : 날짜/시간 추가 질문 상태
+      - "saved"       : 이번 턴에서 할일이 확정됨
+      - "cancelled"   : 유저가 거절해서 취소됨
     """
 
     def __init__(self) -> None:
         self.openai_client = OpenAIClient()
-        # {user_id: {"state": "ask_confirm"|"ask_date",
-        #            "task": str, "date": Optional[str], "time": Optional[str]}}
-        self.pending_todos: Dict[str, Dict] = {}
-        logger.info("할일 추출 서비스 초기화 완료 (대화형)")
+        # key: (user_id, chat_list_num)
+        self.pending_todos: Dict[Tuple[str, int], Dict] = {}
 
     # ------------------------------------------------------------------
-    # 외부에서 호출하는 메인 진입점
+    # public API
     # ------------------------------------------------------------------
-    def process_message(self, user_input: str, user_id: str) -> Dict:
+    def process_message(
+        self,
+        user_input: str,
+        user_id: str,
+        chat_list_num: int,
+    ) -> Dict:
         """
-        사용자 메시지를 처리하여 할일 추출 진행
+        한 턴의 유저 발화를 받아서
+        - 필요한 경우 할일 후보를 감지하고
+        - 진행 중인 플로우(예/아니오, 날짜 물어보기 등)를 이어간다.
 
-        Returns:
-            {
-                "has_todo": bool,        # 최종 확정(saved)된 경우에만 True
-                "response": Optional[str],  # 이번 턴에 '할일 관련'으로 AI가 말해야 할 문장
-                "task": Optional[str],
-                "date": Optional[str],      # 자연어 (예: "내일")
-                "time": Optional[str],      # 자연어 (예: "오전 10시")
-                "step": str,                # "none" | "suggest" | "ask_date" | "saved" | "cancelled"
-            }
+        반환 형식 예시:
+        {
+            "response": "~~~",   # 할일 관련 AI 멘트 (없을 수도 있음)
+            "has_todo": False,   # 이번 턴에 실제로 할일이 확정/저장됐는지
+            "task": "병원 가기",
+            "date": "2025-12-10",   # 가능하면 YYYY-MM-DD
+            "time": "15:00",        # 가능하면 HH:MM (24시간제)
+            "step": "suggest" | "ask_confirm" | "ask_date" | "saved" | "cancelled" | "none",
+        }
         """
+        key = (user_id, chat_list_num)
+
         try:
-            # 1. 이미 진행 중인 할일 플로우가 있으면, 그거 먼저 처리
-            if user_id in self.pending_todos:
-                return self._handle_pending_todo(user_input, user_id)
+            # 1) 이미 진행 중인 플로우가 있으면 그걸 먼저 처리
+            if key in self.pending_todos:
+                return self._handle_pending_todo(key, user_input)
 
-            # 2. 새로운 할일 감지 (GPT 호출)
-            detection_result = self._detect_new_todo(user_input)
-
-            has_todo = bool(detection_result.get("has_todo"))
-            task = detection_result.get("task")
-            date = detection_result.get("date")
-            time = detection_result.get("time")
-
-            # 🔒 불변식: "할일로 감지됐다"고 들어오려면 task는 반드시 있어야 한다.
-            # → has_todo=True인데 task가 없으면, 이번 턴은 그냥 일반 대화로 처리(step="none")
-            if not (has_todo and task):
-                if has_todo and not task:
-                    logger.warning(
-                        "[TodoProcessor] has_todo=True인데 task가 없음. "
-                        f"입력: {user_input!r}, detection_result={detection_result}"
-                    )
-                return {
-                    "has_todo": False,
-                    "response": None,
-                    "task": None,
-                    "date": None,
-                    "time": None,
-                    "step": "none",
-                }
-
-            # 여기 도달했다 = has_todo=True AND task not None ✅
-            # 날짜가 있든 없든, 첫 단계는 항상 "등록해 둘까요?" (suggest)
-            self.pending_todos[user_id] = {
-                "state": "ask_confirm",
-                "task": task,
-                "date": date,  # None 가능
-                "time": time,  # None 가능
-            }
-
-            return {
-                "has_todo": False,  # 아직 유저가 예/아니요 안 했으니까 확정 X
-                "response": f"지금 말씀하신 '{task}'를 할일로 등록해 둘까요?",
-                "task": task,
-                "date": date,
-                "time": time,
-                "step": "suggest",
-            }
+            # 2) 없으면 이번 발화에서 새 할일을 감지
+            return self._detect_new_todo(key, user_input, user_id)
 
         except Exception as e:
-            logger.error(f"[TodoProcessor] process_message 중 오류 - user_id={user_id}, err={e}")
-            return {
-                "has_todo": False,
-                "response": None,
-                "task": None,
-                "date": None,
-                "time": None,
-                "step": "none",
-            }
+            logger.error(
+                f"[TodoProcessor] process_message 중 오류 - user_id={user_id}, err={e}"
+            )
+            return self._result_none()
 
     # ------------------------------------------------------------------
-    # 내부 상태 처리 로직
+    # 내부 상태 처리
     # ------------------------------------------------------------------
-    def _handle_pending_todo(self, user_input: str, user_id: str) -> Dict:
-        """
-        이미 pending_todos 에 저장된 할일 흐름에 대해
-        사용자의 후속 입력(예/아니요/날짜)을 처리한다.
-        """
-        pending = self.pending_todos[user_id]
-        state = pending["state"]
+    def _handle_pending_todo(self, key: Tuple[str, int], user_input: str) -> Dict:
+        pending = self.pending_todos.get(key)
+        if not pending:
+            return self._result_none()
 
-        # 1) "등록해 둘까요?"에 대한 예/아니요 응답 단계
+        state = pending.get("state")
+
+        # 1) 예/아니오 대기 상태
         if state == "ask_confirm":
-            confirmation = self._parse_confirmation(user_input)
+            yn = self._normalize_yn(user_input)
 
-            if confirmation == "yes":
-                task = pending["task"]
-                date = pending["date"]
-                time = pending["time"]
+            # (1) YES → 날짜가 이미 있으면 바로 saved
+            if yn == "yes":
+                task = pending.get("task")
+                date = pending.get("date")
+                time = pending.get("time")
 
-                # 날짜가 이미 있는 경우 → 바로 확정 (saved)
                 if date:
-                    del self.pending_todos[user_id]
-
-                    msg = (
-                        f"네, {date}"
-                        + (f" {time}" if time else "")
-                        + f"에 '{task}' 일정으로 등록해 둘게요."
-                    )
+                    # 이미 날짜가 있을 때는 이번 턴에서 확정
+                    del self.pending_todos[key]
+                    msg = self._build_saved_message(task, date, time)
                     return {
-                        "has_todo": True,
                         "response": msg,
+                        "has_todo": True,
                         "task": task,
                         "date": date,
                         "time": time,
                         "step": "saved",
                     }
+                else:
+                    # 날짜가 없으면 날짜를 물어보는 단계로 전환
+                    pending["state"] = "ask_date"
+                    self.pending_todos[key] = pending
+                    return {
+                        "response": (
+                            "언제까지 해야 하는 일인지 날짜나 대략적인 시점을 알려줄래요? "
+                            "(예: 내일, 이번 주 토요일, 11월 25일)"
+                        ),
+                        "has_todo": False,
+                        "task": pending.get("task"),
+                        "date": None,
+                        "time": None,
+                        "step": "ask_date",
+                    }
 
-                # 날짜가 없는 경우 → 날짜를 물어보는 단계로 전환
-                self.pending_todos[user_id]["state"] = "ask_date"
+            # (2) NO → 플로우 종료
+            if yn == "no":
+                del self.pending_todos[key]
                 return {
+                    "response": "알겠어요. 이번 건은 할일로 등록하지 않을게요.",
                     "has_todo": False,
-                    "response": (
-                        "할일을 등록하려면 날짜가 필요해요.\n"
-                        "날짜를 알려주시면 추가해 드릴게요.\n"
-                        "예: 내일, 내일 오전 10시, 11월 25일"
-                    ),
-                    "task": task,
-                    "date": None,
-                    "time": None,
-                    "step": "ask_date",
-                }
-
-            if confirmation == "no":
-                # 사용자가 거절 → 이 pending은 버리고 종료
-                del self.pending_todos[user_id]
-                return {
-                    "has_todo": False,
-                    "response": "알겠어요, 일정으로는 따로 남기지 않을게요.",
                     "task": None,
                     "date": None,
                     "time": None,
                     "step": "cancelled",
                 }
 
-            # 🔥 그 외(응답이 애매하거나, 다른 얘기) → 이 pending을 버리고 일반 대화로 전환
-            del self.pending_todos[user_id]
+            # (3) 애매한 답 → 그냥 플로우 종료하고 일반 대화로 넘김
+            del self.pending_todos[key]
+            return self._result_none()
+
+        # 2) 날짜/시간을 기다리는 상태
+        if state == "ask_date":
+            task = pending.get("task")
+            # 여기서는 user_input 전체를 date 문자열로 받아두고,
+            # 실제 date/time 파싱은 백엔드 라우터(_parse_korean_natural_datetime)에서 처리한다.
+            date_text = user_input.strip()
+
+            del self.pending_todos[key]
             return {
-                "has_todo": False,
-                "response": None,   # 별도 할일 멘트 없이 일반 챗으로 넘어가게 함
-                "task": None,
-                "date": None,
+                "response": f"좋아요. '{task}'를 '{date_text}'까지 해야 할 일로 등록해 둘게요.",
+                "has_todo": True,
+                "task": task,
+                "date": date_text,
                 "time": None,
-                "step": "none",
+                "step": "saved",
             }
 
-        # 2) 날짜/시간을 물어보는 단계
-        if state == "ask_date":
-            datetime_result = self._parse_datetime(user_input)
-            date = datetime_result.get("date")
-            time = datetime_result.get("time")
+        # 그 외 알 수 없는 state → 방어적으로 초기화
+        del self.pending_todos[key]
+        return self._result_none()
 
-            if date:
-                task = pending["task"]
-                del self.pending_todos[user_id]
+    def _detect_new_todo(
+        self,
+        key: Tuple[str, int],
+        user_input: str,
+        user_id: str,
+    ) -> Dict:
+        """
+        새 할일 후보를 LLM으로 감지하는 부분.
+        """
+        try:
+            extracted = self._call_todo_extractor(user_input, user_id)
+        except Exception:
+            logger.exception("[TodoProcessor] 할일 추출 중 오류")
+            return self._result_none()
 
-                msg = (
-                    f"네, {date}"
-                    + (f" {time}" if time else "")
-                    + f"에 '{task}' 일정으로 등록해 둘게요."
+        if not extracted or not extracted.get("has_todo"):
+            return self._result_none()
+
+        task_raw = (extracted.get("task") or "").strip()
+        date = (extracted.get("date") or "").strip() or None
+        time_raw = (extracted.get("time") or "").strip()
+
+        # time 후처리: 빈 문자열이나 "00:00" 같은 기본값은 None으로 처리
+        if time_raw in ("", "00:00", "00:00:00", "0:00"):
+            time = None
+        else:
+            time = time_raw
+
+        task = task_raw
+
+        # 안전장치: has_todo=True 인데 task가 비어 있으면 무시
+        if not task:
+            logger.warning(
+                "[TodoProcessor] has_todo=True 이지만 task 가 비어 있어서 무시합니다. extracted=%s",
+                extracted,
+            )
+            return self._result_none()
+
+        # --------------------------------------------------------------
+        # 1) "할일 등록해줘" 같이 '직접 등록 요청'인 경우 → 바로 saved/ask_date
+        # --------------------------------------------------------------
+        normalized = user_input.replace(" ", "")
+
+        direct_register_keywords = [
+            "할일등록",
+            "할일로등록",
+            "할일추가",
+            "할일로추가",
+        ]
+        direct_register = (
+            any(kw in normalized for kw in direct_register_keywords)
+            or (
+                any(
+                    kw in normalized
+                    for kw in ["등록해줘", "등록해주라", "등록해줄래", "등록해줘라"]
                 )
+                and ("할일" in normalized or "할일로" in normalized)
+            )
+        )
+
+        if direct_register:
+            # 날짜가 이미 있으면 → 바로 확정(saved)
+            if date:
+                self.pending_todos.pop(key, None)
+                msg = self._build_saved_message(task, date, time)
                 return {
-                    "has_todo": True,
                     "response": msg,
+                    "has_todo": True,
                     "task": task,
                     "date": date,
                     "time": time,
                     "step": "saved",
                 }
+            else:
+                # 날짜가 없으면 → 바로 날짜를 물어보는 단계로
+                self.pending_todos[key] = {
+                    "state": "ask_date",
+                    "task": task,
+                    "date": None,
+                    "time": time,
+                }
+                return {
+                    "response": (
+                        "할일로 등록해 줄게요. 언제까지 해야 하는 일인지 "
+                        "날짜나 대략적인 시점을 알려줄래요? "
+                        "(예: 내일, 이번 주 토요일, 11월 25일)"
+                    ),
+                    "has_todo": False,
+                    "task": task,
+                    "date": None,
+                    "time": None,
+                    "step": "ask_date",
+                }
 
-            # 🔥 날짜가 전혀 안 잡힌 경우 = 사용자가 다른 얘기를 한 걸로 보고 이 pending을 버림
-            del self.pending_todos[user_id]
-            return {
-                "has_todo": False,
-                "response": None,   # 일반 챗으로 전환
-                "task": None,
-                "date": None,
-                "time": None,
-                "step": "none",
-            }
+        # --------------------------------------------------------------
+        # 2) 일반적인 경우 → 제안 모드(suggest)로 플로우 시작
+        # --------------------------------------------------------------
+        self.pending_todos[key] = {
+            "state": "ask_confirm",
+            "task": task,
+            "date": date,
+            "time": time,
+        }
 
-        # 알 수 없는 상태 → 초기화
-        del self.pending_todos[user_id]
+        suggestion = f"지금 말씀하신 '{task}'를 할일 목록에 등록해 둘까요?"
+
         return {
+            "response": suggestion,
+            # 아직 사용자가 '응'을 안 했으므로 실제로 저장된 할일은 아님
             "has_todo": False,
-            "response": None,
+            "task": task,
+            "date": date,
+            "time": time,
+            "step": "suggest",
+        }
+
+    # ------------------------------------------------------------------
+    # LLM 호출 및 유틸
+    # ------------------------------------------------------------------
+    def _call_todo_extractor(self, user_input: str, user_id: str) -> Dict:
+        """
+        실제 LLM 호출 부분.
+
+        - OpenAIClient.chat_completion(...) 사용
+        - response_format={"type": "json_object"} 로 JSON만 돌려받도록 요청
+        - 여기서 날짜/시간을 최대한 절대값(YYYY-MM-DD, HH:MM)으로 정규화하도록 지시
+        - task 는 '병원 가기', '약 먹기'처럼 짧은 할 일 제목으로 정리하도록 지시
+        """
+        now = datetime.now(KST)
+        today_str = now.strftime("%Y-%m-%d")
+        weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][now.weekday()]
+
+        system_msg = f"""
+너는 사용자의 한국어 대화에서 '할일(todo)'을 찾아내는 도우미야.
+
+[날짜/시간 처리 규칙]
+- 오늘은 {today_str} {weekday_kr}요일 (KST 기준)이다.
+- 사용자가 "오늘", "내일", "모레", "이번 주 토요일", "다음주 3시에"처럼
+  상대적인 날짜/시간을 말하면, **반드시 절대 날짜/시간으로 계산해서** JSON에 넣어야 한다.
+- date 필드는 가능하면 "YYYY-MM-DD" 형식으로 채운다.
+- time 필드는 가능하면 24시간제 "HH:MM" 형식으로 채운다.
+- 시각에 오전/오후가 명시되지 않은 경우에는 해당 숫자 그대로 시(hour)로 사용하고,
+  분은 "00"으로 맞춘다. (예: "3시" → "03:00")
+- "다음주" 단독 또는 "다음주 3시에" 같은 표현이 나오면:
+  * 기준은 항상 "오늘({today_str})과 같은 요일의 다음 주"로 삼는다.
+  * 예: 오늘이 수요일이면 "다음주 3시에"는
+    → 오늘과 같은 요일(수요일)의 다음 주 날짜를 date에 넣어야 한다.
+
+- **사용자가 시각(몇 시, 오전/오후, 몇 시 반 등)을 전혀 말하지 않은 경우에는**
+  time 필드는 반드시 null 로 두어야 한다.
+  "00:00" 처럼 임의의 기본값을 넣지 마라.
+
+[task 작성 규칙 (중요)]
+- task 는 사용자가 해야 할 일을 나타내는 **짧은 '할 일 제목'** 으로 써야 한다.
+- 문장 전체를 그대로 쓰지 말고, 핵심 동작만 뽑아서 **동사 명사형(~하기, ~가기, ~사기 등)** 으로 작성해라.
+- 어색한 표현(예: "병원에 가봐야할거", "청소를 좀 해야할 것 같음")은 자연스러운 제목으로 정리해라.
+
+  예시:
+  - "배가 아파서 내일 병원에 가봐야 할 것 같아"
+    → task: "병원 가기"
+  - "엄마 생신 선물도 사야지"
+    → task: "엄마 생신 선물 사기"
+  - "서류를 제출해야 되는데 자꾸 까먹네"
+    → task: "서류 제출하기"
+  - "약 먹는 거 잊지 말아야지"
+    → task: "약 먹기"
+
+- 다음은 **안 되는** task 예시:
+  - "병원에 가봐야할거"  (문장 일부, 어색한 표현)
+  - "서류를 제출해야 될 것 같음" (전체 문장)
+  → 이런 경우는 각각 "병원 가기", "서류 제출하기"처럼 정리해서 넣어라.
+
+[출력 규칙]
+- 한 번에 하나의 사용자의 발화만 보고 아래 스키마를 만족하는 JSON **한 개만** 반환해.
+- has_todo 가 false 이면 task, date, time 은 모두 null 로 채운다.
+- JSON 이외의 텍스트는 절대 섞지 말고, 키 이름을 정확히 지켜라.
+        """
+
+        user_msg = (
+            "다음 문장에서 사용자가 해야 할 일이 있는지 찾아줘.\n"
+            f"문장: {user_input}\n\n"
+            "반환 형식(JSON): "
+            '{'
+            '"has_todo": true 또는 false, '
+            '"task": 문자열 또는 null, '
+            '"date": "YYYY-MM-DD" 또는 null, '
+            '"time": "HH:MM" 또는 null'
+            '}\n\n'
+            "- 날짜나 시간이 아예 언급되지 않으면 date/time 은 null 로 둬.\n"
+            "- 상대적인 날짜/시간 표현이 있으면 위에서 설명한 규칙대로 절대 날짜/시간으로 바꿔서 넣어.\n"
+            "- 시간을 말하지 않은 경우에는 time 에 절대로 \"00:00\" 같은 기본값을 넣지 말고 null 로 둬.\n"
+            "- task 는 반드시 위의 'task 작성 규칙'을 지켜서 자연스러운 할 일 제목으로만 작성해."
+        )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        # OpenAIClient.chat_completion 은 문자열을 돌려준다.
+        response_text = self.openai_client.chat_completion(
+            messages=messages,
+            max_tokens=300,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+
+        return self._parse_todo_json(response_text)
+
+    def _parse_todo_json(self, response: str) -> Dict:
+        """
+        LLM 응답 문자열에서 JSON 덩어리만 뽑아서 dict 로 변환.
+        (response_format 을 JSON 으로 요청했어도 방어적으로 한 번 더 처리)
+        """
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+
+        # 텍스트 안에 포함된 JSON 조각 찾기
+        json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
+        json_match = re.search(json_pattern, response, re.DOTALL)
+
+        if json_match:
+            json_str = json_match.group().strip()
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                logger.error(
+                    f"[TodoProcessor] JSON 파싱 실패(부분 문자열): {json_str[:150]}"
+                )
+
+        logger.error(f"[TodoProcessor] JSON 파싱 실패: {response[:150]}")
+        return {}
+
+    def _normalize_yn(self, text: str) -> str:
+        """
+        사용자의 짧은 답변을 yes/no/other 로 정규화.
+
+        1차: 키워드 매칭 (빠르고 공짜)
+        2차: 키워드로 못 잡으면 LLM에 분류 요청
+        """
+        t = text.strip().lower()
+
+        # 한국어/영어 긍정
+        yes_keywords = [
+            "응",
+            "어",
+            "어어",
+            "그래",
+            "좋아",
+            "넵",
+            "네",
+            "예",
+            "웅",
+            "ㅇㅇ",
+            "ok",
+            "okay",
+            "예스",
+            "ㅇㅋ",
+            "엉",
+            "해줘",
+            "해주세요",
+            "좋아요",
+            "등록",
+            "등록해줘",
+        ]
+        no_keywords = [
+            "아니",
+            "아냐",
+            "ㄴㄴ",
+            "노",
+            "no",
+            "괜찮아",
+            "됐어",
+        ]
+
+        # 1차: 키워드 매칭
+        for kw in yes_keywords:
+            if kw in t:
+                return "yes"
+        for kw in no_keywords:
+            if kw in t:
+                return "no"
+
+        # 2차: 키워드로 애매한 경우에만 LLM 분류
+        try:
+            return self._classify_yn_llm(text)
+        except Exception as e:
+            logger.error(f"[TodoProcessor] _classify_yn_llm 오류: {e}")
+            return "other"
+
+    def _classify_yn_llm(self, text: str) -> str:
+        """
+        LLM에게 이 발화가 yes/no/other 중 무엇인지 분류하도록 요청.
+
+        - "yes": 할일 등록 제안에 대한 명확한 긍정
+        - "no" : 할일 등록 제안에 대한 명확한 부정
+        - "other": 질문에 대한 답이 아니거나 애매한 경우
+        """
+        system_msg = (
+            "너는 한국어 대화에서 '이 대답이 어떤 제안(질문)에 대한 긍정/부정/기타인지'만 분류하는 도우미야.\n"
+            "지금 상황은 보통 이런 흐름이야:\n"
+            '- AI: \"지금 말씀하신 내용을 할일로 등록해 둘까요?\"\n'
+            "- 사용자: 여러 가지 방식으로 대답함\n\n"
+            "너는 사용자의 발화를 보고 다음 셋 중 하나로만 분류해야 해:\n"
+            '- \"yes\": 제안(할일 등록)에 대한 분명한 긍정 '
+            "(예: 응, 그래, 해야지, 등록해줘, 좋아요, 그렇게 해, 당연하지 등)\n"
+            '- \"no\": 제안에 대한 분명한 부정 '
+            "(예: 아니, 필요 없어, 됐어, 그냥 둘게, 그건 하지 말자 등)\n"
+            '- \"other\": 질문에 대한 답이 아니거나, 맥락상 애매해서 확실히 yes/no라고 보기 어려운 경우\n\n'
+            "반드시 JSON 형식으로만 짧게 답해야 해.\n"
+            '예: {\"answer\": \"yes\"}'
+        )
+
+        user_msg = (
+            "다음 사용자의 발화가 yes / no / other 중 무엇인지 분류해줘.\n"
+            "사용자 발화:\n"
+            f"{text}\n\n"
+            '반환 형식(JSON): {"answer": "yes" | "no" | "other"}'
+        )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        resp = self.openai_client.chat_completion(
+            messages=messages,
+            max_tokens=30,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+
+        try:
+            data = json.loads(resp)
+            ans = (data.get("answer") or "").strip().lower()
+            if ans in ("yes", "no", "other"):
+                return ans
+        except json.JSONDecodeError:
+            logger.error(
+                f"[TodoProcessor] _classify_yn_llm JSON 파싱 실패: {resp[:100]}"
+            )
+
+        return "other"
+
+    def _build_saved_message(
+        self,
+        task: str,
+        date: Optional[str],
+        time: Optional[str],
+    ) -> str:
+        """
+        step == 'saved' 일 때 사용자에게 보여줄 안내 멘트 구성.
+
+        - 시간 정보가 없거나 "00:00"처럼 기본값으로 보이는 경우에는
+          시간 부분은 생략하고 날짜까지만 보여준다.
+        """
+        # "00:00" 류는 없는 시간 취급
+        if not time or time.startswith("00:00"):
+            time = None
+
+        if date and time:
+            return f"알겠어요. '{task}'를 {date} {time}까지 해야 할 일로 등록해 둘게요."
+        if date:
+            return f"알겠어요. '{task}'를 {date}까지 해야 할 일로 등록해 둘게요."
+        return f"알겠어요. '{task}'를 할일로 등록해 둘게요."
+
+    def _result_none(self) -> Dict:
+        """
+        할일 관련 동작이 전혀 없을 때 공통으로 쓰는 기본 응답.
+        """
+        return {
+            "response": "",
+            "has_todo": False,
             "task": None,
             "date": None,
             "time": None,
             "step": "none",
         }
-
-    # ------------------------------------------------------------------
-    # GPT를 사용한 "새 할일 감지" / "날짜/시간 파싱"
-    # ------------------------------------------------------------------
-    def _detect_new_todo(self, user_input: str) -> Dict:
-        """새로운 할일 감지 (GPT 호출)"""
-        try:
-            detection_prompt = """사용자 메시지에서 구체적인 일정이나 할일을 찾아주세요.
-
-[추출 기준]
-- 구체적인 "행동 + 대상"이 분명한 경우만 추출
-  - 예: "내일 오전 10시에 병원 가야 해요" → task: "병원 가기"
-  - 예: "도서관에 가야 해" → task: "도서관 가기"
-  - 예: "손주한테 전화해야겠다" → task: "손주에게 전화하기"
-- 단순한 시간 언급(예: "내일 9시에 가야 해")처럼
-  '어디에/무엇을'이 없는 경우에는 할일로 보지 마세요.
-
-[중요 규칙]
-- task는 짧은 한국어 표현으로만 써야 합니다. (예: "병원 가기", "손주에게 전화하기")
-- task를 분명하게 정할 수 없다면, 반드시 has_todo를 false로 설정하세요.
-
-[응답 형식]
-반드시 아래 JSON 형식 '하나만' 반환하세요. 설명 문장 없이 JSON만 출력하세요.
-
-{
-  "has_todo": true,
-  "task": "병원 가기",
-  "date": "내일",
-  "time": "오전 10시"
-}
-
-- 할일이 없거나 task를 정하기 어렵다면:
-  {"has_todo": false, "task": null, "date": null, "time": null}
-- 날짜/시간이 없으면 해당 필드는 null
-"""
-
-            user_message = f'사용자 메시지: "{user_input}"\n\n위 메시지에서 할일을 찾아 JSON으로만 답변하세요.'
-            response = self.openai_client.simple_chat(user_message, detection_prompt)
-            result = self._parse_json_response(response)
-
-            has_todo = bool(result.get("has_todo"))
-            task = result.get("task") if has_todo else None
-            date = result.get("date") if has_todo else None
-            time = result.get("time") if has_todo else None
-
-            return {
-                "has_todo": has_todo,
-                "task": task,
-                "date": date,
-                "time": time,
-            }
-
-        except Exception as e:
-            logger.error(f"[TodoProcessor] 할일 감지 중 오류: {e}")
-            return {"has_todo": False, "task": None, "date": None, "time": None}
-
-    def _parse_confirmation(self, user_input: str) -> str:
-        """
-        확인 응답 파싱 (예/아니요)
-
-        - "응", "예", "네", "추가해줘", "등록해줘", "넣어줘", "기억해줘" 등 → yes
-        - "아니", "싫어", "필요 없어", "괜찮아" 등 → no
-        - 그 밖에 다른 얘기 → unknown
-        """
-        text = user_input.strip().lower()
-
-        yes_keywords = [
-            "응", "예", "네", "좋아", "그래", "맞아",
-            "ok", "okay", "ㅇㅋ", "ㅇㅇ",
-            "추가", "등록", "넣어", "넣어줘", "해줘", "해 주세요", "해줘요",
-            "해놓", "기억해", "기억해줘",
-        ]
-        no_keywords = [
-            "아니", "아냐", "안", "싫어", "그만", "그냥 놔둬",
-            "no", "ㄴㄴ", "거절", "말아", "필요없", "필요 없어", "괜찮아",
-        ]
-
-        if any(word in text for word in yes_keywords):
-            return "yes"
-
-        if any(word in text for word in no_keywords):
-            return "no"
-
-        return "unknown"
-
-    def _parse_datetime(self, user_input: str) -> Dict:
-        """날짜/시간 파싱 (GPT 호출)"""
-        try:
-            parse_prompt = """사용자가 입력한 날짜/시간을 추출해주세요.
-
-[응답 형식]
-반드시 아래 JSON 형식 '하나만' 반환하세요. 설명 문장 없이 JSON만 출력하세요.
-
-{
-  "date": "내일",
-  "time": "오전 10시"
-}
-
-- 시간이 없으면 time은 null
-- 날짜를 찾을 수 없으면 date와 time 모두 null
-"""
-
-            user_message = f'사용자 입력: "{user_input}"\n\n날짜와 시간을 추출해서 JSON으로만 답변하세요.'
-            response = self.openai_client.simple_chat(user_message, parse_prompt)
-            result = self._parse_json_response(response)
-
-            date = result.get("date")
-            time = result.get("time")
-            return {"date": date, "time": time}
-
-        except Exception as e:
-            logger.error(f"[TodoProcessor] 날짜/시간 파싱 중 오류: {e}")
-            return {"date": None, "time": None}
-
-    def _parse_json_response(self, response: str) -> Dict:
-        """GPT 응답에서 JSON 추출 및 파싱"""
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            # {...} 패턴만 추출해서 다시 시도
-            json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
-            json_match = re.search(json_pattern, response, re.DOTALL)
-
-            if json_match:
-                json_str = json_match.group().strip()
-                try:
-                    return json.loads(json_str)
-                except json.JSONDecodeError:
-                    logger.error(
-                        f"[TodoProcessor] JSON 파싱 실패(부분 문자열): {json_str[:150]}"
-                    )
-
-            logger.error(f"[TodoProcessor] JSON 파싱 실패: {response[:150]}")
-            return {}

@@ -1,36 +1,33 @@
-# src/models/item_list.py
+# src/models/background_list.py
 from sqlalchemy import String, event
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.db.database import Base
 from sqlalchemy.dialects.mysql import SMALLINT
 
-class ItemList(Base):
-    __tablename__ = "item_list"
+class BackgroundList(Base):
+    __tablename__ = "background_list"
     __table_args__ = {"mysql_engine": "InnoDB"}
-    item_number: Mapped[int] = mapped_column(
+    background_number: Mapped[int] = mapped_column(
         SMALLINT(unsigned=True),
         primary_key=True,
         autoincrement=True
     )
     
-    item_name: Mapped[str] = mapped_column(
+    background_name: Mapped[str] = mapped_column(
         String(20),
         nullable=False
     )
     
-    item_price: Mapped[int] = mapped_column(
+    background_price: Mapped[int] = mapped_column(
         SMALLINT(unsigned=True),
         nullable=False
     )
 
-    ai = relationship(
-        "AiProfile", 
-        back_populates="item_list",
-    )
-
-    item_buy_list = relationship(
-        "ItemBuyList",
-        back_populates="item_list",
+    background_buy_list = relationship(
+        "BackgroundBuyList",
+        back_populates="background_list",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 """
